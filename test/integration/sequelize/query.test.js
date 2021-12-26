@@ -262,9 +262,28 @@ describe(Support.getTestDialectTeaser('Sequelize'), () => {
         );
 
         const users = await this.sequelize.query('CALL foo()');
-        expect(users.map(u => {
-          return u.username;
-        })).to.include('john');
+        expect(users.map(u => u.username)).to.include('john');
+      });
+    } else if (dialect === 'mssql') {
+      it('executes stored procedures', async function () {
+        // This could use CREATE OR ALTER to overwrite any previously existing procedure
+        // but that is not supported syntax in MS Sql 12.
+
+        const drop_sql = 'IF OBJECT_ID(\'foo\') IS NOT NULL EXECUTE(\'DROP PROCEDURE foo\')';
+
+        await this.sequelize.query(drop_sql);
+
+        await this.sequelize.query(this.insertQuery);
+
+        await this.sequelize.query(
+          `CREATE PROCEDURE foo AS\nSELECT * FROM ${this.User.tableName};`,
+        );
+
+        const users = await this.sequelize.query('\t EXEC\t foo');
+
+        await this.sequelize.query(drop_sql);
+
+        expect(users.map(u => u.username)).to.include('john');
       });
     } else if (dialect === 'db2') {
       it('executes stored procedures', function () {
@@ -276,16 +295,14 @@ describe(Support.getTestDialectTeaser('Sequelize'), () => {
               `CREATE PROCEDURE foo() DYNAMIC RESULT SETS 1 LANGUAGE SQL BEGIN DECLARE cr1 CURSOR WITH RETURN FOR SELECT * FROM ${qq(self.User.tableName)}; OPEN cr1; END`,
             ).then(() => {
               return self.sequelize.query('CALL foo()').then(users => {
-                expect(users.map(u => {
-                  return u.username;
-                })).to.include('john');
+                expect(users.map(u => u.username)).to.include('john');
               });
             });
           });
         });
       });
     } else {
-      console.log('FIXME: I want to be supported in this dialect as well :-(');
+      console.log(`${__filename} FIXME: it("executes stored procedures"): I want to be supported in this dialect as well :-(`);
     }
 
     it('uses the passed model', async function () {
