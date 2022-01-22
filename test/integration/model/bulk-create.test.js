@@ -53,11 +53,34 @@ describe(Support.getTestDialectTeaser('Model'), () => {
   describe('bulkCreate', () => {
     if (current.dialect.supports.transactions) {
       it('supports transactions', async function () {
+
+        if (dialect === 'mssql') {
+          // The default value for READ_COMMITTED_SNAPSHOT is OFF in MS SQL Server Express, but it must be
+          // set to ON so different transactions can access different snapshots of the data, else transactions
+          // will just lock the rows and this test will timeout due to the second transaction waiting for the lock.
+          // The ALTER DATABASE statement is protected with an IF just in case the user running the unit test does not
+          // have the necessary GRANT to run the ALTER statement, but if the configuration value is already set to 1,
+          // allow the test to succeed. Else, the ALTER statement would fail, which means the test would timeout
+          // regardless if the ALTER statement did not run.
+          // Note, this ALTER statement is persistent, you only need to run it once.
+          await this.sequelize.query(`
+            IF NOT EXISTS(SELECT 1 FROM sys.databases WHERE name = DB_NAME() AND is_read_committed_snapshot_on = 1)
+              ALTER DATABASE sequelize_test SET READ_COMMITTED_SNAPSHOT ON
+          `);
+        }
+
         const User = this.sequelize.define('User', {
           username: DataTypes.STRING,
         });
+
         await User.sync({ force: true });
-        const transaction = await this.sequelize.transaction();
+
+        const transaction = await this.sequelize.transaction(
+          // READ_COMMITED should be the default value, but stays here for reference and also because the isolation
+          // level must be this value else the test might hang due to row locks or read dirty data.
+          { isolationLevel: Sequelize.Transaction.ISOLATION_LEVELS.READ_COMMITTED },
+        );
+
         await User.bulkCreate([{ username: 'foo' }, { username: 'bar' }], { transaction });
         const count1 = await User.count();
         const count2 = await User.count({ transaction });
