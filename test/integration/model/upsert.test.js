@@ -3,6 +3,7 @@
 const chai = require('chai');
 const sinon = require('sinon');
 const Sequelize = require('sequelize');
+const sequelizeErrors = require('sequelize/lib/errors');
 
 const expect = chai.expect;
 const Support = require('../support');
@@ -217,14 +218,22 @@ describe(Support.getTestDialectTeaser('Model'), () => {
       });
 
       it('works with primary key using .field', async function () {
-        const [, created0] = await this.ModelWithFieldPK.upsert({ userId: 42, foo: 'first' });
-        expect_created(created0, true);
+        let [, created] = await this.ModelWithFieldPK.upsert({ userId: 42, foo: 'first' });
+        expect_created(created, true);
 
         this.clock.tick(1000);
-        const [, created] = await this.ModelWithFieldPK.upsert({ userId: 42, foo: 'second' });
+        [, created] = await this.ModelWithFieldPK.upsert({ userId: 42, foo: 'second' });
         expect_created(created, false);
 
-        const instance = await this.ModelWithFieldPK.findOne({ where: { userId: 42 } });
+        let instance = await this.ModelWithFieldPK.findOne({ where: { userId: 42 } });
+        expect(instance.foo).to.equal('second');
+
+        // no-op, but it still needs to go through without trouble.
+        [instance, created] = await this.ModelWithFieldPK.upsert({ foo: 'second' });
+        expect_created(created, false);
+        expect(instance.foo).to.equal('second');
+
+        instance = await this.ModelWithFieldPK.findOne({ where: { userId: 42 } });
         expect(instance.foo).to.equal('second');
       });
 
@@ -393,6 +402,109 @@ describe(Support.getTestDialectTeaser('Model'), () => {
         const user = await User.findOne({ where: { name: 'user1', address: 'address' } });
         expect(user.createdAt).to.be.ok;
         expect(user.city).to.equal('New City');
+      });
+
+      it('works with primary key and one composite index', async () => {
+        const User = current.define('User', {
+          id: {
+            autoIncrement: true,
+            type: DataTypes.INTEGER,
+            allowNull: false,
+            primaryKey: true,
+          },
+          name: DataTypes.STRING,
+          address: DataTypes.STRING,
+          city: {
+            type: DataTypes.STRING,
+            allowNull: false,
+            field: 'City',
+          },
+          phone: DataTypes.STRING,
+        }, {
+          indexes: [{
+            name: 'pk_user',
+            unique: true,
+            fields: [{ name: 'id' }],
+          },
+          {
+            name: 'n_a_c',
+            unique: true,
+            fields: ['name', { name: 'address', order: 'DESC' }, 'City'],
+          }],
+
+          timestamps: false,
+        });
+        await User.sync({ force: true });
+
+        async function callUpsert(payload) {
+          const options = { returning: false };
+          const [obj, created] = await User.upsert(payload, options);
+          if (current.dialect.supports.returnValues) {
+            return [obj, created];
+          }
+
+          // dialets without returnValues will not return full objects from upsert queries.
+          // The returned object contains just the updated values, and the id (primary key).
+          // But this test wants to checks all columns of the model.
+          const readback = await User.findByPk(obj.id);
+          expect(readback.dataValues).to.include(obj.dataValues);
+
+          return [readback.dataValues, created];
+        }
+
+        function props(o) {
+          return { id: o.id,  name: o.name, address: o.address, city: o.city, phone: o.phone };
+        }
+
+        // 1. First clean insert
+        const id1 = 1;
+        const payload1 = { name: 'user1', address: 'address1', city: 'city1', phone: '999999' };
+        const [obj1, created1] = await callUpsert(payload1);
+
+        expect_created(created1, true);
+        expect(props(obj1)).to.eql({ id: id1, ...payload1 });
+
+        // 2. Update object by id, since it is present in update values together with unique columns
+        const payload2 = { name: 'user1.1', address: 'address1.1', city: 'city1', phone: '888888' };
+        const [obj2, created2] = await callUpsert({ id: id1, ...payload2 });
+
+        expect_created(created2, false);
+        expect(props(obj2)).to.eql({ id: id1, ...payload2 });
+
+        // 3. Update object by unique index (name,address,phone) since id is not present.
+        const payload3 = { name: 'user1.1', address: 'address1.1', city: 'city1', phone: '777777' };
+        const [obj3, created3] = await callUpsert(payload3);
+
+        expect_created(created3, false);
+        expect(props(obj3)).to.eql({ id: id1, ...payload3 });
+
+        // 4. Repeat last operation, this time just with the columns in the unique index. It should
+        // just be a no-op and cause no confusion due to missing update values.
+        const payload4 = { name: 'user1.1', address: 'address1.1', city: 'city1' };
+        const [obj4, created4] = await callUpsert(payload4);
+
+        expect_created(created4, false);
+        expect(props(obj4)).to.eql({ id: id1, ...payload3 });
+
+        if (dialect === 'sqlite') {
+          // Whoops, sqlite increments the id even though a new line is not inserted.
+          await current.query('DELETE FROM `sqlite_sequence` WHERE `name` = \'Users\'');
+        }
+
+        // 5. New fresh insert. Plus, try to pass NULL as ID, which is not allowed, and let it
+        // fallback to the autoIncrement value.
+        const id2 = 2;
+        const payload5 = { name: 'user2', address: 'address2', city: 'city2', phone: '222222' };
+        const [obj5, created5] = await callUpsert({ id: null, ...payload5 });
+
+        expect_created(created5, true);
+        expect(props(obj5)).to.eql({ id: id2, ...payload5 });
+
+        // 6. Fail to update object.id=2 due to duplicate unique index (name,address,city)
+        const payload6 = { phone: '333333', ...payload3 };
+        const promise6 = callUpsert({ id: id2, ...payload6 });
+        const ex6 = await expect(promise6).to.eventually.be.rejectedWith(sequelizeErrors.UniqueConstraintError);
+        expect(ex6.errors.map(e => e.path)).to.eql(['name', 'address', 'City']);
       });
 
       if (dialect === 'mssql') {
